@@ -7,8 +7,10 @@ Original file is located at
     https://colab.research.google.com/drive/1M1ZKfWB84vyjbfh9W0EWqgGGzvez1ieA
 """
 
-!python -m spacy download it_core_news_lg
+# !python -m spacy download it_core_news_lg
 
+import os
+import json
 import spacy
 import torch
 from transformers import AutoTokenizer, AutoModel
@@ -16,6 +18,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LinearRegression
@@ -34,7 +37,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.preprocessing import StandardScaler
 import nltk
 
-nltk.download("stopwords")
+# nltk.download("stopwords")
 nlp = spacy.load("it_core_news_lg")
 
 def obtain_populist_keywords(df):
@@ -70,7 +73,7 @@ def assign_labels(texts, keywords):
   #dati dei testi e delle keywords, assegna un punteggio ad ogni testo come frequenza relativa
   #delle keywords in quel testo
     scores = []
-    for text in texts:
+    for text in tqdm(texts):
         doc = nlp(text)
         word_count = len(doc)
         keyword_count = sum(1 for token in doc if token.text.lower() in keywords)
@@ -96,11 +99,11 @@ def get_long_text_representation(text, tokenizer, model, max_length=512, stride=
 def get_representations(texts):
   #Funziona, ma troncando i testi dopo 512 token
     embeddings = []
-    for text in texts:
-        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512)
+    for text in tqdm(texts):
+        inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True, max_length=512).to("cuda")
         with torch.no_grad():
             outputs = model(**inputs)
-        embeddings.append(outputs.last_hidden_state.mean(dim=1).squeeze().numpy())
+        embeddings.append(outputs.last_hidden_state.mean(dim=1).squeeze().cpu().numpy())
     return np.array(embeddings)
 
 def probe_regression(X, Y):
@@ -112,15 +115,16 @@ def probe_regression(X, Y):
   cv_scores = cross_val_score(model, X, Y, cv=3, scoring='r2')  # R^2 Score
   cv_predictions = cross_val_predict(model, X, Y, cv=3)
 
-  print("Cross-Validation R² Scores:", cv_scores)
-  print("Mean R² Score:", cv_scores.mean())
-
   mse = mean_squared_error(dataset_Y, cv_predictions)
   spearman = stats.spearmanr(dataset_Y, cv_predictions)
 
-  print("Cross-Validated MSE:", mse)
-  print("Spearman:", spearman)
-  print("\n\n")
+  return {
+    "crossvalidation_r2": cv_scores.tolist(),
+    "mean_r2_score": cv_scores.mean(),
+    "crossvalidated_mse": mse,
+    "spearman": spearman.statistic.item(),
+    "spearman_pvalue": spearman.pvalue.item()
+  }
 
 def probe_classification(X, Y):
   #Dati i due set X e Y, applica un modello di classificazione lineare
@@ -129,7 +133,7 @@ def probe_classification(X, Y):
 
   param_grid = {
       'C': [0.01, 0.1, 1, 10, 100],
-      'loss': ['squared_hinge', 'hinge'],
+      'loss': ['squared_hinge'],
       'penalty': ['l1', 'l2']
   }
 
@@ -139,30 +143,47 @@ def probe_classification(X, Y):
   classifier = grid_search.best_estimator_
 
   y_pred = classifier.predict(X_test)
-  print(classification_report(y_test, y_pred))
+
+  return classification_report(y_test, y_pred, output_dict=True)
 
 df = pd.read_csv("annotated_texts_repr.csv", sep=",", encoding="utf-8")
 df = df[["text", "pop_sum"]]
-df = df.iloc[:100]
+# df = df.iloc[:100]
 
 df['pop_sum'] = df['pop_sum'].apply(lambda x: 0 if x < 2 else 1) #divido i testi in populisti e non populisti
 
 keywords = obtain_populist_keywords(df)
 
 dataset_X = list(df["text"])
-dataset_Y = assign_labels(dataset_X, keywords)
+if os.path.exists("labels.txt"):
+  dataset_Y = pd.read_csv("labels.txt").values.astype(float).tolist()
+else:
+  dataset_Y = assign_labels(dataset_X, keywords)
+  with open("labels.txt", "w") as log:
+    log.write("label\n")
+    log.writelines([str(s) + "\n" for s in dataset_Y])
 
 model_path = 'finetuned_pol_model' #modello fine-tunato
-model = AutoModel.from_pretrained(model_path)
+model = AutoModel.from_pretrained(model_path).to("cuda")
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
-dataset_Z = get_representations(dataset_X)
+if os.path.exists("representations.npy"):
+  with open("representations.npy", "rb") as log:
+    dataset_Z =np.load(log)
+else:
+  dataset_Z = get_representations(dataset_X)
+  with open("representations.npy", "wb") as log:
+    np.save(log, dataset_Z)
+
 
 #Versione senza truncation a 512 token:
 #dataset_Z = np.array([get_long_text_representation(text, tokenizer, model) for text in dataset_X])
 
-probe_regression(dataset_Z, dataset_Y)
+with open("regression.json", "w") as log:
+  json.dump(probe_regression(dataset_Z, dataset_Y), log)
 
 median_value = np.median(dataset_Y)
 binary_representation = [0 if x < median_value else 1 for x in dataset_Y]
-probe_classification(dataset_Z, binary_representation)
+
+with open("classification.json", "w") as log:
+  json.dump(probe_classification(dataset_Z, binary_representation), log)
